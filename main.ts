@@ -1,219 +1,341 @@
-// photo-geolocator-01 entry: for each of the instance's 25 photos, ask
-// gpt-6.1-sol once where it was taken, with a reasoning prompt that
-// reads the visual evidence first, then parse the latitude and longitude.
-// A photo whose model call is refused or yields no coordinates still gets
-// an answer: a fixed prior (50, 10), central Europe, the densest
-// Mapillary coverage region — a ~7,000 km error on average, far better
-// than the 20,015 km an unanswered photo counts. Every photo is answered.
-//
-// Runs as the grader runs an entry, `node /bot/main.ts` on Node 22
-// (erasable TypeScript, the standard library only), with the trial's
-// variables: MAKEFUN_ENV_URL (the env), OPENAI_BASE_URL and
-// OPENAI_API_KEY (the gateway and the dummy key it swaps for the real
-// one). Model calls run on the OpenAI key pushed to the competition
-// before submitting; with no key pushed every call is answered 401 and
-// every photo falls back to the prior, still scored.
-//
-// Deterministic given the model's answers: every request is a function of
-// the photo's bytes and the fixed prompt, the calls run four at a time and
-// their answers are posted in photo order in a single POST, so a replay
-// sends the same calls and leaves the same answers. No wall clock, no
-// unseeded randomness anywhere in a request.
+/**
+ * make.fun photo-geolocator-01 entry agent.
+ *
+ * One model call per photo (POST to {OPENAI_BASE_URL}/chat/completions).
+ * Every photo gets an answer: if the model cannot place it, a fixed fallback
+ * of latitude 50, longitude 10 (central Europe) is used.
+ * Transient errors (408, 429, 5xx) are retried up to 3 times with a fixed
+ * 2000ms*(attempt+1) backoff; gateway refusals (any other 4xx) are final and
+ * fall back to (50, 10).
+ * Deterministic: no Date.now, no Math.random, no wall clock anywhere.
+ */
 
-const MODEL = 'gpt-6.1-sol';
-const MAX_TOKENS = 1024;
-const CONCURRENCY = 4;
-/** Fallback guess when a photo cannot be placed: central Europe (50, 10). */
-const FALLBACK = { lat: 50, lon: 10 };
+type Photo = { id: string | number; url: string; answered: boolean };
+type Coord = { lat: number | null; lon: number | null };
+
+const MAKEFUN_ENV_URL = process.env.MAKEFUN_ENV_URL;
+const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
+if (!MAKEFUN_ENV_URL || !OPENAI_BASE_URL || !OPENAI_API_KEY) {
+  throw new Error(
+    'Missing required env vars: MAKEFUN_ENV_URL, OPENAI_BASE_URL, OPENAI_API_KEY',
+  );
+}
+
+const envUrl = MAKEFUN_ENV_URL.replace(/\/+$/, '');
+const openaiBaseUrl = OPENAI_BASE_URL.replace(/\/+$/, '');
+
 const PROMPT =
-  'You are a geolocation expert. Look carefully at this street-level photo and determine where on Earth it was taken.\n' +
-  'First, in 2-4 short sentences, note the strongest visual clues, in this order: (1) any text on signs, shop names, license plates or road markings — what language and alphabet; (2) architecture and building styles; (3) road layout, which side traffic drives on, road markings and traffic signs; (4) vegetation, climate and terrain; (5) vehicles, people, clothing and any flags or distinctive objects.\n' +
-  'Then, on its own final line, give your single best estimate as JSON: {"lat": <degrees north>, "lon": <degrees east>}.\n' +
-  'If the clues are weak, still give your best guess — never refuse and never leave the coordinates out.';
-/** Retried with a fixed backoff: a provider's transient errors. A gateway refusal (4xx) is final. */
-const RETRY_STATUSES = [408, 429, 500, 502, 503, 504, 529];
-const RETRIES = 3;
+  'You are a geolocation expert. Look carefully at this street-level photo and determine where on Earth it was taken. First, in 2-4 short sentences, note the strongest visual clues, in this order: (1) any text on signs, shop names, license plates or road markings — what language and alphabet; (2) architecture and building styles; (3) road layout, which side traffic drives on, road markings and traffic signs; (4) vegetation, climate and terrain; (5) vehicles, people, clothing and any flags or distinctive objects. Then, on its own final line, give your single best estimate as JSON: {"lat": <degrees north>, "lon": <degrees east>}. If the clues are weak, still give your best guess — never refuse and never leave the coordinates out.';
 
-interface Photo {
-  id: string;
-  url: string;
-  answered: boolean;
+const TRANSIENT_STATUSES = new Set([408, 429, 500, 502, 503, 504, 529]);
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-interface Guess {
-  id: string;
-  lat: number;
-  lon: number;
+function base64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
 }
 
-function need(name: string): string {
-  const v = process.env[name];
-  if (v === undefined || v === '') throw new Error(`${name} is not set`);
-  return v;
+async function fetchJson<T>(url: string, init: RequestInit): Promise<T> {
+  const res = await fetch(url, init);
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} for ${url}`);
+  }
+  return (await res.json()) as T;
 }
 
-const envUrl = need('MAKEFUN_ENV_URL').replace(/\/+$/, '');
-const openaiUrl = need('OPENAI_BASE_URL').replace(/\/+$/, '');
-const apiKey = need('OPENAI_API_KEY');
+async function fetchPhotos(): Promise<Photo[]> {
+  const data = await fetchJson<{ photos: Photo[] }>(
+    `${envUrl}/photos`,
+    { method: 'GET' },
+  );
+  return data.photos;
+}
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+async function fetchPhotoBytes(url: string): Promise<Uint8Array | null> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(`${envUrl}${url}`);
+      if (res.ok) {
+        const ab = await res.arrayBuffer();
+        return new Uint8Array(ab);
+      }
+      if (TRANSIENT_STATUSES.has(res.status)) {
+        lastError = new Error(`HTTP ${res.status} fetching photo ${url}`);
+        await delay(1000 * (attempt + 1));
+        continue;
+      }
+      return null;
+    } catch (err) {
+      lastError = err;
+      await delay(1000 * (attempt + 1));
+    }
+  }
+  return null;
+}
 
-/** The model's answer to one photo, as text; null when the gateway refused the call (final). */
-async function ask(jpeg: Buffer): Promise<string | null> {
-  const body = JSON.stringify({
-    model: MODEL,
-    max_tokens: MAX_TOKENS,
+async function askModel(jpegBase64: string): Promise<string | null> {
+  const body = {
+    model: 'gpt-6.1-sol',
+    max_tokens: 1024,
     messages: [
       {
         role: 'user',
         content: [
-          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${jpeg.toString('base64')}` } },
+          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${jpegBase64}` } },
           { type: 'text', text: PROMPT },
         ],
       },
     ],
-  });
-  for (let attempt = 0; ; attempt += 1) {
-    let res: Response;
+  };
+
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      res = await fetch(`${openaiUrl}/chat/completions`, {
+      const res = await fetch(`${openaiBaseUrl}/chat/completions`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-        body,
+        headers: {
+          'Authorization': `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
       });
-    } catch (err) {
-      if (attempt < RETRIES) {
-        await sleep(2000 * (attempt + 1));
-        continue;
+
+      const shouldRetryHeader = res.headers.get('x-should-retry');
+      const forceNoRetry = shouldRetryHeader === 'false';
+
+      if (!res.ok) {
+        if (TRANSIENT_STATUSES.has(res.status) && !forceNoRetry) {
+          lastError = new Error(`HTTP ${res.status} from model`);
+          await delay(2000 * (attempt + 1));
+          continue;
+        }
+        // Gateway refusal or any other 4xx — final.
+        const text = await res.text().catch(() => '');
+        console.error(`Model request failed: HTTP ${res.status} ${text}`);
+        return null;
       }
-      process.stderr.write(`geolocator: model call failed to send: ${(err as Error).message}\n`);
-      return null;
+
+      const data = await res.json();
+      const choice = data.choices?.[0];
+      if (!choice) return null;
+      const content = choice.message?.content;
+      if (content === undefined || content === null) return null;
+      if (typeof content === 'string') return content;
+      if (Array.isArray(content)) {
+        return content
+          .filter((part) => part.type === 'text')
+          .map((part) => (part as { text?: string }).text ?? '')
+          .join('');
+      }
+      return String(content);
+    } catch (err) {
+      lastError = err;
+      await delay(2000 * (attempt + 1));
     }
-    if (res.ok) {
-      const msg = (await res.json()) as { choices?: { message?: { content?: string | { type: string; text?: string }[] } }[] };
-      const content = msg.choices?.[0]?.message?.content ?? '';
-      return typeof content === 'string' ? content : content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('\n');
-    }
-    const text = await res.text();
-    if (RETRY_STATUSES.includes(res.status) && res.headers.get('x-should-retry') !== 'false' && attempt < RETRIES) {
-      await sleep(2000 * (attempt + 1));
-      continue;
-    }
-    process.stderr.write(`geolocator: the model call was refused (HTTP ${res.status}): ${text.slice(0, 300)}\n`);
-    return null;
   }
+  return null;
 }
 
-const isLat = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= -90 && v <= 90;
-const isLon = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= -180 && v <= 180;
+function extractJsonObjects(text: string): { lat: unknown; lon: unknown }[] {
+  const objects: { lat: unknown; lon: unknown }[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
 
-const asNumber = (v: unknown): number | null => {
-  if (typeof v === 'number') return v;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === '}') {
+      if (depth > 0) {
+        depth--;
+        if (depth === 0 && start >= 0) {
+          try {
+            const obj = JSON.parse(text.slice(start, i + 1));
+            if (obj && typeof obj === 'object') {
+              objects.push(obj as { lat: unknown; lon: unknown });
+            }
+          } catch {
+            // ignore malformed fragment
+          }
+          start = -1;
+        }
+      }
+    }
+  }
+  return objects;
+}
+
+function parseLatLonFromValue(v: unknown): number | null {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
   if (typeof v === 'string') {
-    const n = Number(v.trim());
+    const n = Number(v);
     return Number.isFinite(n) ? n : null;
   }
   return null;
-};
+}
 
-/** The latitude and longitude an answer gives: its last JSON object with lat and lon, else its first two numbers in range. */
-function coordinates(text: string): { lat: number; lon: number } | null {
-  let found: { lat: number; lon: number } | null = null;
-  for (const m of text.matchAll(/\{[^{}]*\}/g)) {
-    try {
-      const o = JSON.parse(m[0]) as Record<string, unknown>;
-      const lat = asNumber(o.lat ?? o.latitude);
-      const lon = asNumber(o.lon ?? o.lng ?? o.longitude);
-      if (lat !== null && lon !== null && isLat(lat) && isLon(lon)) found = { lat, lon };
-    } catch {
-      // Not JSON: the next one, or the numbers below.
+function parseCoordFromObject(obj: { lat: unknown; lon: unknown }): Coord | null {
+  const latKeys = ['lat', 'latitude'];
+  const lonKeys = ['lon', 'lng', 'longitude'];
+  let lat: number | null = null;
+  let lon: number | null = null;
+  for (const k of latKeys) {
+    if (k in obj) { lat = parseLatLonFromValue(obj[k]); break; }
+  }
+  for (const k of lonKeys) {
+    if (k in obj) { lon = parseLatLonFromValue(obj[k]); break; }
+  }
+  if (lat === null || lon === null) return null;
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+  return { lat, lon };
+}
+
+function findFirstConsecutivePair(text: string): Coord | null {
+  const nums: number[] = [];
+  let i = 0;
+  const len = text.length;
+  while (i < len) {
+    const ch = text[i];
+    if (ch === '-' || (ch >= '0' && ch <= '9') || ch === '.') {
+      let start = i;
+      if (ch === '-') {
+        i++;
+        if (i >= len || !(text[i] >= '0' && text[i] <= '9')) continue;
+      }
+      let dotSeen = false;
+      while (i < len && ((text[i] >= '0' && text[i] <= '9') || (text[i] === '.' && !dotSeen))) {
+        if (text[i] === '.') dotSeen = true;
+        i++;
+      }
+      const n = Number(text.slice(start, i));
+      if (Number.isFinite(n)) nums.push(n);
+    } else {
+      i++;
     }
   }
-  if (found !== null) return found;
-  const nums = [...text.matchAll(/-?\d+(?:\.\d+)?/g)].map((m) => Number(m[0]));
-  for (let i = 0; i + 1 < nums.length; i += 1) {
-    if (isLat(nums[i]) && isLon(nums[i + 1])) return { lat: nums[i]!, lon: nums[i + 1]! };
+  for (let j = 0; j + 1 < nums.length; j++) {
+    const a = nums[j];
+    const b = nums[j + 1];
+    if (a >= -90 && a <= 90 && b >= -180 && b <= 180) {
+      return { lat: a, lon: b };
+    }
   }
   return null;
 }
 
-/** A photo's bytes; null when the env would not serve it after retries. */
-async function fetchPhoto(url: string): Promise<Buffer | null> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      const res = await fetch(url);
-      if (res.ok) return Buffer.from(await res.arrayBuffer());
-      process.stderr.write(`geolocator: photo fetch HTTP ${res.status} for ${url}\n`);
-    } catch (err) {
-      process.stderr.write(`geolocator: photo fetch failed for ${url}: ${(err as Error).message}\n`);
-    }
-    if (attempt >= RETRIES) return null;
-    await sleep(1000 * (attempt + 1));
+function parseCoordinates(text: string): Coord | null {
+  const objects = extractJsonObjects(text);
+  for (let i = objects.length - 1; i >= 0; i--) {
+    const parsed = parseCoordFromObject(objects[i]);
+    if (parsed) return parsed;
   }
+  return findFirstConsecutivePair(text);
 }
 
-const round6 = (v: number): number => Math.round(v * 1e6) / 1e6;
-
-async function postAnswers(answers: Guess[]): Promise<boolean> {
-  const body = JSON.stringify({ answers });
-  for (let attempt = 0; ; attempt += 1) {
+async function postAnswers(answers: { id: string | number; lat: number; lon: number }[]): Promise<boolean> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const res = await fetch(`${envUrl}/answers`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answers }),
       });
-      const text = await res.text();
-      process.stdout.write(`geolocator: POST /answers attempt ${attempt + 1}: HTTP ${res.status} ${text}\n`);
-      if (res.ok) return true;
-      if (!RETRY_STATUSES.includes(res.status) || attempt >= RETRIES) return false;
+      if (res.ok) {
+        console.log(`Answers POST succeeded: HTTP ${res.status}`);
+        return true;
+      }
+      if (TRANSIENT_STATUSES.has(res.status)) {
+        lastError = new Error(`HTTP ${res.status} posting answers`);
+        await delay(2000 * (attempt + 1));
+        continue;
+      }
+      const text = await res.text().catch(() => '');
+      console.error(`Answers POST failed: HTTP ${res.status} ${text}`);
+      return false;
     } catch (err) {
-      process.stderr.write(`geolocator: POST /answers failed to send: ${(err as Error).message}\n`);
-      if (attempt >= RETRIES) return false;
+      lastError = err;
+      await delay(2000 * (attempt + 1));
     }
-    await sleep(1000 * (attempt + 1));
+  }
+  console.error('Answers POST failed after retries:', lastError);
+  return false;
+}
+
+async function processPhoto(photo: Photo): Promise<{ id: string | number; lat: number; lon: number; byModel: boolean }> {
+  const fallback = { id: photo.id, lat: 50, lon: 10, byModel: false };
+
+  const bytes = await fetchPhotoBytes(photo.url);
+  if (!bytes) return fallback;
+
+  const jpegBase64 = base64(bytes);
+  const reply = await askModel(jpegBase64);
+  if (!reply) return fallback;
+
+  const coord = parseCoordinates(reply);
+  if (!coord) return fallback;
+
+  return { id: photo.id, lat: coord.lat, lon: coord.lon, byModel: true };
+}
+
+async function main(): Promise<void> {
+  const photos = await fetchPhotos();
+  const unanswered = photos.filter((p) => !p.answered);
+
+  const concurrency = 4;
+  const results: Array<{ id: string | number; lat: number; lon: number; byModel: boolean }> = [];
+
+  for (let i = 0; i < unanswered.length; i += concurrency) {
+    const batch = unanswered.slice(i, i + concurrency);
+    const batchResults = await Promise.all(batch.map(processPhoto));
+    results.push(...batchResults);
+  }
+
+  const byModel = results.filter((r) => r.byModel).length;
+  const byFallback = results.length - byModel;
+  console.log(`Placed ${byModel} photos by model, ${byFallback} by fallback.`);
+
+  const answers = results.map((r) => ({
+    id: r.id,
+    lat: Math.round(r.lat * 1e6) / 1e6,
+    lon: Math.round(r.lon * 1e6) / 1e6,
+  }));
+
+  const ok = await postAnswers(answers);
+  if (ok) {
+    process.exit(0);
+  } else {
+    process.exit(1);
   }
 }
 
-async function main(): Promise<number> {
-  const listed = (await (await fetch(`${envUrl}/photos`)).json()) as { photos: Photo[] };
-  const photos = listed.photos.filter((p) => !p.answered);
-  const guesses: Guess[] = new Array(photos.length);
-  let viaModel = 0;
-  let viaFallback = 0;
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    while (next < photos.length) {
-      const i = next;
-      next += 1;
-      const p = photos[i]!;
-      let c: { lat: number; lon: number } | null = null;
-      const jpeg = await fetchPhoto(`${envUrl}${p.url}`);
-      if (jpeg !== null) {
-        const text = await ask(jpeg);
-        if (text !== null) c = coordinates(text);
-        if (c === null) process.stderr.write(`geolocator: no coordinates for ${p.id}, falling back\n`);
-      } else {
-        process.stderr.write(`geolocator: could not fetch ${p.id}, falling back\n`);
-      }
-      if (c !== null) {
-        viaModel += 1;
-        guesses[i] = { id: p.id, lat: round6(c.lat), lon: round6(c.lon) };
-      } else {
-        viaFallback += 1;
-        guesses[i] = { id: p.id, lat: FALLBACK.lat, lon: FALLBACK.lon };
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
-  process.stdout.write(`geolocator: ${photos.length} photos: ${viaModel} placed by the model, ${viaFallback} fallback\n`);
-  const ok = await postAnswers(guesses);
-  return ok ? 0 : 1;
-}
-
-try {
-  process.exitCode = await main();
-} catch (err) {
-  process.stderr.write(`geolocator: ${(err as Error).stack ?? String(err)}\n`);
-  process.exitCode = 1;
-}
+main().catch((err) => {
+  console.error(err.stack ?? String(err));
+  process.exit(1);
+});
